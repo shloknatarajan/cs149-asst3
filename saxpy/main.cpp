@@ -19,7 +19,7 @@ int main(int argc, char** argv)
 {
 
     // default: arrays of 100M numbers
-    int N = 100 * 1000 * 1000;
+    int N = 20 * 1000 * 1000;
 
     // parse commandline options ////////////////////////////////////////////
     int opt;
@@ -44,6 +44,7 @@ int main(int argc, char** argv)
     // end parsing of commandline options //////////////////////////////////////
 
     const float alpha = 2.0f;
+    printf("N: %d\n", N);
     float* xarray = new float[N];
     float* yarray = new float[N];
     float* resultarray = new float[N];
