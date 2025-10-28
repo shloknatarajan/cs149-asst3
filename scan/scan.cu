@@ -27,24 +27,48 @@ static inline int nextPow2(int n) {
     return n;
 }
 
-// exclusive_scan --
-//
-// Implementation of an exclusive scan on global memory array `input`,
-// with results placed in global memory `result`.
-//
-// N is the logical size of the input and output arrays, however
-// students can assume that both the start and result arrays we
-// allocated with next power-of-two sizes as described by the comments
-// in cudaScan().  This is helpful, since your parallel scan
-// will likely write to memory locations beyond N, but of course not
-// greater than N rounded up to the next power of 2.
-//
-// Also, as per the comments in cudaScan(), you can implement an
-// "in-place" scan, since the timing harness makes a copy of input and
-// places it in result
+__global__ void mark_repeats_kernel(int* input, int length, int* flags) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < length - 1) {
+        flags[idx] = (input[idx] == input[idx + 1]) ? 1 : 0;
+    } else if (idx == length - 1) {
+        flags[idx] = 0; 
+    }
+}
+
+__global__ void scatter_indices_kernel(int* flags, int* scanned, int length, int* output) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < length - 1 && flags[idx] == 1) {
+        output[scanned[idx]] = idx;
+    }
+}
+
+__global__ void upsweep_kernel(int* output, int num_iterations, int two_d, int two_dplus1) {
+    int iter = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (iter < num_iterations) {
+        int i = iter * two_dplus1;
+        output[i + two_dplus1 - 1] += output[i + two_d - 1];
+    }
+}
+
+__global__ void downsweep_kernel(int* output, int num_iterations, int two_d, int two_dplus1) {
+    int iter = blockIdx.x * blockDim.x + threadIdx.x;
+  
+    if (iter < num_iterations) {
+        int i = iter * two_dplus1;
+        int t = output[i + two_d - 1];
+        output[i + two_d - 1] = output[i + two_dplus1 - 1];
+        output[i + two_dplus1 - 1] += t;
+    }
+}
+
 void exclusive_scan(int* input, int N, int* result)
 {
-
+    const int threadsPerBlock = 256;
+    const int blocks = (N + threadsPerBlock - 1) / threadsPerBlock;
     // CS149 TODO:
     //
     // Implement your exclusive scan implementation here.  Keep in
@@ -53,11 +77,47 @@ void exclusive_scan(int* input, int N, int* result)
     // on the CPU.  Your implementation will need to make multiple calls
     // to CUDA kernel functions (that you must write) to implement the
     // scan.
+    int rounded_N = nextPow2(N);
+    
+    // Upsweep phase
+    for (int two_d = 1; two_d <= rounded_N/2; two_d *= 2) {
+        int two_dplus1 = 2 * two_d;
+        int num_iterations = rounded_N / two_dplus1;
+        
+        const int threadsPerBlock = 256;
+        const int blocks = (num_iterations + threadsPerBlock - 1) / threadsPerBlock;
+        
+        upsweep_kernel<<<blocks, threadsPerBlock>>>(result, num_iterations, two_d, two_dplus1);
+    }
 
-
+    // Set last element to 0
+    cudaMemset(&result[rounded_N - 1], 0, sizeof(int));
+    
+    // Downsweep phase
+    for (int two_d = rounded_N/2; two_d >= 1; two_d /= 2) {
+        int two_dplus1 = 2 * two_d;
+        int num_iterations = rounded_N / two_dplus1;
+        
+        const int threadsPerBlock = 256;
+        const int blocks = (num_iterations + threadsPerBlock - 1) / threadsPerBlock;
+        
+        downsweep_kernel<<<blocks, threadsPerBlock>>>(result, num_iterations, two_d, two_dplus1);
+    }
 }
-
-
+int* do_scatter(int* flags, int* scanned, int length, int* output) {
+    int threadsPerBlock = 256;
+    int blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
+    scatter_indices_kernel<<<blocks, threadsPerBlock>>>(flags, scanned, length, output);
+    return output;
+}
+int* getRepeatsFlags(int* input, int length) {
+    int threadsPerBlock = 256;
+    int blocks = (length + threadsPerBlock - 1) / threadsPerBlock;
+    int* device_flags;
+    cudaMalloc((void **)&device_flags, sizeof(int) * length);
+    mark_repeats_kernel<<<blocks, threadsPerBlock>>>(input, length, device_flags);
+    return device_flags;
+}
 //
 // cudaScan --
 //
@@ -160,8 +220,30 @@ int find_repeats(int* device_input, int length, int* device_output) {
     // exclusive_scan function with them. However, your implementation
     // must ensure that the results of find_repeats are correct given
     // the actual array length.
+    int rounded_length = nextPow2(length);
+    int* device_scanned;
+    cudaMalloc((void **)&device_scanned, rounded_length * sizeof(int));
+    cudaMemset(device_scanned, 0, rounded_length * sizeof(int));
+    
+    int* device_flags = getRepeatsFlags(device_input, length);
+    
+    int last_flag;
+    cudaMemcpy(&last_flag, &device_flags[length - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    printf("last_flag: %d\n", last_flag);
+    fflush(stdout);
 
-    return 0; 
+    cudaMemcpy(device_scanned, device_flags, length * sizeof(int), cudaMemcpyDeviceToDevice);
+    exclusive_scan(device_flags, rounded_length, device_scanned);
+    
+    int last_scan_value;
+    cudaMemcpy(&last_scan_value, &device_scanned[length - 1], sizeof(int), cudaMemcpyDeviceToHost);
+    int num_total_flags = last_scan_value + last_flag;
+    
+    do_scatter(device_flags, device_scanned, length, device_output);
+    
+    cudaFree(device_flags);
+    cudaFree(device_scanned);
+    return num_total_flags; 
 }
 
 
