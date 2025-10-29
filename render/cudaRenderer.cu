@@ -385,46 +385,80 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 // ensure order of update or mutual exclusion on the output image, the
 // resulting image will be incorrect.
 __global__ void kernelRenderCircles() {
-
+    short imageWidth = cuConstRendererParams.imageWidth;
+    short imageHeight = cuConstRendererParams.imageHeight;
     int index = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if (index >= cuConstRendererParams.numCircles)
+    if (index >= imageWidth * imageHeight)
         return;
 
     int index3 = 3 * index;
 
-    // read position and radius
-    float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    float  rad = cuConstRendererParams.radius[index];
+    for (int circleIndex = 0; circleIndex < cuConstRendererParams.numCircles; circleIndex++) {
 
-    // compute the bounding box of the circle. The bound is in integer
-    // screen coordinates, so it's clamped to the edges of the screen.
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    short minX = static_cast<short>(imageWidth * (p.x - rad));
-    short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    short minY = static_cast<short>(imageHeight * (p.y - rad));
-    short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+        int index3 = 3 * circleIndex;
+        float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+        float  rad = cuConstRendererParams.radius[circleIndex];
 
-    // a bunch of clamps.  Is there a CUDA built-in for this?
-    short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+        // compute the bounding box of the circle. The bound is in integer
+        // screen coordinates, so it's clamped to the edges of the screen.
+        
+        short minX = static_cast<short>(imageWidth * (p.x - rad));
+        short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+        short minY = static_cast<short>(imageHeight * (p.y - rad));
+        short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
 
-    float invWidth = 1.f / imageWidth;
-    float invHeight = 1.f / imageHeight;
+        // a bunch of clamps.  Is there a CUDA built-in for this?
+        short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+        short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+        short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+        short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
 
-    // for all pixels in the bonding box
-    for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
-        float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
-        for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
+        float invWidth = 1.f / imageWidth;
+        float invHeight = 1.f / imageHeight;
+
+        // for all pixels in the bonding box
+        int pixelX = index % imageWidth;
+        int pixelY = index / imageWidth;
+        if (pixelX >= screenMinX && pixelX < screenMaxX && pixelY >= screenMinY && pixelY < screenMaxY) {
+            float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
             float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(index, pixelCenterNorm, p, imgPtr);
+            shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
             imgPtr++;
         }
     }
+    // // read position and radius
+    // float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+    // float  rad = cuConstRendererParams.radius[index];
+
+    // // compute the bounding box of the circle. The bound is in integer
+    // // screen coordinates, so it's clamped to the edges of the screen.
+
+    // short minX = static_cast<short>(imageWidth * (p.x - rad));
+    // short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
+    // short minY = static_cast<short>(imageHeight * (p.y - rad));
+    // short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
+
+    // // a bunch of clamps.  Is there a CUDA built-in for this?
+    // short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
+    // short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
+    // short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
+    // short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
+
+    // float invWidth = 1.f / imageWidth;
+    // float invHeight = 1.f / imageHeight;
+
+    // // for all pixels in the bonding box
+    // for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
+        
+    //     for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
+    //         float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
+    //                                              invHeight * (static_cast<float>(pixelY) + 0.5f));
+    //         shadePixel(index, pixelCenterNorm, p, imgPtr);
+    //         imgPtr++;
+    //     }
+    // }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////
@@ -638,7 +672,8 @@ CudaRenderer::render() {
 
     // 256 threads per block is a healthy number
     dim3 blockDim(256, 1);
-    dim3 gridDim((numCircles + blockDim.x - 1) / blockDim.x);
+
+    dim3 gridDim((image->width * image->height + blockDim.x - 1) / blockDim.x);
 
     kernelRenderCircles<<<gridDim, blockDim>>>();
     cudaDeviceSynchronize();

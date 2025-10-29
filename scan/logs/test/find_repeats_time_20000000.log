@@ -1,0 +1,13 @@
+---------------------------------------------------------
+Found 1 CUDA devices
+Device 0: NVIDIA T4G
+   SMs:        40
+   Global mem: 14914 MB
+   CUDA Cap:   7.5
+---------------------------------------------------------
+Array size: 20000000
+last_flag: 0
+last_flag: 0
+last_flag: 0
+Student GPU time: 19.556 ms
+Find_repeats outputs are correct!
