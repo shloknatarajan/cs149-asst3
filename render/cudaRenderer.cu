@@ -381,9 +381,9 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
 // kernelRenderCircles -- (CUDA device code)
 //
-// Each thread renders a circle.  Since there is no protection to
-// ensure order of update or mutual exclusion on the output image, the
-// resulting image will be incorrect.
+// One thread per pixel. Each pixel-thread loops over all circles in input.
+// prev: circle by circle
+
 __global__ void kernelRenderCircles() {
     short imageWidth = cuConstRendererParams.imageWidth;
     short imageHeight = cuConstRendererParams.imageHeight;
@@ -391,8 +391,6 @@ __global__ void kernelRenderCircles() {
 
     if (index >= imageWidth * imageHeight)
         return;
-
-    int index3 = 3 * index;
 
     for (int circleIndex = 0; circleIndex < cuConstRendererParams.numCircles; circleIndex++) {
 
@@ -421,11 +419,10 @@ __global__ void kernelRenderCircles() {
         int pixelX = index % imageWidth;
         int pixelY = index / imageWidth;
         if (pixelX >= screenMinX && pixelX < screenMaxX && pixelY >= screenMinY && pixelY < screenMaxY) {
-            float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + screenMinX)]);
+            float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
             float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
                                                  invHeight * (static_cast<float>(pixelY) + 0.5f));
             shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
-            imgPtr++;
         }
     }
     // // read position and radius
