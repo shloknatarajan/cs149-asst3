@@ -746,16 +746,12 @@ void CudaRenderer::render() {
     thrust::device_ptr<int> offsets_ptr(circleOffsets);
     thrust::exclusive_scan(counts_ptr, counts_ptr + numTiles, offsets_ptr);
 
-    int lastOffset, lastCount;
+    int lastOffset;
+    int lastCount;
     cudaMemcpy(&lastOffset, circleOffsets + (numTiles - 1), sizeof(int), cudaMemcpyDeviceToHost);
     cudaMemcpy(&lastCount, tileCounts + (numTiles - 1), sizeof(int), cudaMemcpyDeviceToHost);
     int totalRefs = lastOffset + lastCount;
     cudaMemcpy(circleOffsets + numTiles, &totalRefs, sizeof(int), cudaMemcpyHostToDevice);
-
-    if (totalRefs == 0) {
-        return;
-    }
-
     int* compactedCircles;
     cudaMalloc(&compactedCircles, sizeof(int) * totalRefs);
 
