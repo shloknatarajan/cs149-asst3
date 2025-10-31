@@ -501,7 +501,7 @@ __global__ void kernelWriteCompactedLists( int* circleOffsets, int* compactedCir
             int pos = baseOffset + writeOffset + prefixSumOutput[threadIdx.x];
             compactedCircles[pos] = circleIndex;
         }
-        __syncthreads();
+        // __syncthreads();
         int chunkCount = prefixSumOutput[SCAN_BLOCK_DIM - 1] + prefixSumInput[SCAN_BLOCK_DIM - 1];
         writeOffset += chunkCount;
     }
