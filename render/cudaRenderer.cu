@@ -13,6 +13,13 @@
 #include "noise.h"
 #include "sceneLoader.h"
 #include "util.h"
+#include "circleBoxTest.cu_inl"
+#define SCAN_BLOCK_DIM 1024
+#include "exclusiveScan.cu_inl"
+#define TILE_SIZE 32
+
+#include <thrust/scan.h>
+#include <thrust/device_ptr.h>
 
 ////////////////////////////////////////////////////////////////////////////////////////
 // Putting all the cuda kernels here
@@ -318,44 +325,31 @@ __global__ void kernelAdvanceSnowflake() {
 // pixel from the circle.  Update of the image is done in this
 // function.  Called by kernelRenderCircles()
 __device__ __inline__ void
-shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
-
+shadePixelLocal(int circleIndex, float2 pixelCenter, float3 p, float4* localColor) {
     float diffX = p.x - pixelCenter.x;
     float diffY = p.y - pixelCenter.y;
     float pixelDist = diffX * diffX + diffY * diffY;
 
-    float rad = cuConstRendererParams.radius[circleIndex];;
+    float rad = cuConstRendererParams.radius[circleIndex];
     float maxDist = rad * rad;
 
-    // circle does not contribute to the image
+    // Circle does not contribute to the image
     if (pixelDist > maxDist)
         return;
 
     float3 rgb;
     float alpha;
 
-    // there is a non-zero contribution.  Now compute the shading value
-
-    // suggestion: This conditional is in the inner loop.  Although it
-    // will evaluate the same for all threads, there is overhead in
-    // setting up the lane masks etc to implement the conditional.  It
-    // would be wise to perform this logic outside of the loop next in
-    // kernelRenderCircles.  (If feeling good about yourself, you
-    // could use some specialized template magic).
-    if (cuConstRendererParams.sceneName == SNOWFLAKES || cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
-
+    if (cuConstRendererParams.sceneName == SNOWFLAKES || 
+        cuConstRendererParams.sceneName == SNOWFLAKES_SINGLE_FRAME) {
         const float kCircleMaxAlpha = .5f;
         const float falloffScale = 4.f;
-
         float normPixelDist = sqrt(pixelDist) / rad;
         rgb = lookupColor(normPixelDist);
-
         float maxAlpha = .6f + .4f * (1.f-p.z);
-        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f); // kCircleMaxAlpha * clamped value
+        maxAlpha = kCircleMaxAlpha * fmaxf(fminf(maxAlpha, 1.f), 0.f);
         alpha = maxAlpha * exp(-1.f * falloffScale * normPixelDist * normPixelDist);
-
     } else {
-        // simple: each circle has an assigned color
         int index3 = 3 * circleIndex;
         rgb = *(float3*)&(cuConstRendererParams.color[index3]);
         alpha = .5f;
@@ -363,101 +357,181 @@ shadePixel(int circleIndex, float2 pixelCenter, float3 p, float4* imagePtr) {
 
     float oneMinusAlpha = 1.f - alpha;
 
-    // BEGIN SHOULD-BE-ATOMIC REGION
-    // global memory read
-
-    float4 existingColor = *imagePtr;
-    float4 newColor;
-    newColor.x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
-    newColor.y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
-    newColor.z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
-    newColor.w = alpha + existingColor.w;
-
-    // global memory write
-    *imagePtr = newColor;
-
-    // END SHOULD-BE-ATOMIC REGION
+    // Blend into LOCAL accumulator (no global memory access!)
+    float4 existingColor = *localColor;
+    localColor->x = alpha * rgb.x + oneMinusAlpha * existingColor.x;
+    localColor->y = alpha * rgb.y + oneMinusAlpha * existingColor.y;
+    localColor->z = alpha * rgb.z + oneMinusAlpha * existingColor.z;
+    localColor->w = alpha + existingColor.w;
 }
+
 
 // kernelRenderCircles -- (CUDA device code)
 //
 // One thread per pixel. Each pixel-thread loops over all circles in input.
 // prev: circle by circle
-
-__global__ void kernelRenderCircles() {
-    short imageWidth = cuConstRendererParams.imageWidth;
-    short imageHeight = cuConstRendererParams.imageHeight;
-    int index = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (index >= imageWidth * imageHeight)
+__global__ void kernelRenderCircles(int* circleOffsets, int* compactedCircles, int numTilesX) {
+    int pixelX = blockIdx.x * blockDim.x + threadIdx.x;
+    int pixelY = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    int imageWidth = cuConstRendererParams.imageWidth;
+    int imageHeight = cuConstRendererParams.imageHeight;
+    
+    if (pixelX >= imageWidth || pixelY >= imageHeight)
         return;
-
-    for (int circleIndex = 0; circleIndex < cuConstRendererParams.numCircles; circleIndex++) {
-
+    
+    // Figure out which tile this pixel belongs to
+    int tileX = pixelX / TILE_SIZE;
+    int tileY = pixelY / TILE_SIZE;
+    int tileIndex = tileY * numTilesX + tileX;
+    
+    // Get the range of circles that intersect this tile
+    int startIdx = circleOffsets[tileIndex];
+    int endIdx = circleOffsets[tileIndex + 1];
+    
+    // Prepare pixel data
+    float invWidth = 1.f / imageWidth;
+    float invHeight = 1.f / imageHeight;
+    float2 pixelCenterNorm = make_float2(
+        invWidth * (static_cast<float>(pixelX) + 0.5f),
+        invHeight * (static_cast<float>(pixelY) + 0.5f)
+    );
+    
+    // LOCAL ACCUMULATOR - stays in registers!
+    float4 pixelColor = make_float4(1.f, 1.f, 1.f, 1.f); // Start with cleared color
+    
+    // Loop through circles IN ORDER and accumulate locally
+    for (int i = startIdx; i < endIdx; i++) {
+        int circleIndex = compactedCircles[i];
+        
         int index3 = 3 * circleIndex;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        float  rad = cuConstRendererParams.radius[circleIndex];
-
-        // compute the bounding box of the circle. The bound is in integer
-        // screen coordinates, so it's clamped to the edges of the screen.
         
-        short minX = static_cast<short>(imageWidth * (p.x - rad));
-        short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-        short minY = static_cast<short>(imageHeight * (p.y - rad));
-        short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-        // a bunch of clamps.  Is there a CUDA built-in for this?
-        short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-        short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-        short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-        short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-        float invWidth = 1.f / imageWidth;
-        float invHeight = 1.f / imageHeight;
-
-        // for all pixels in the bonding box
-        int pixelX = index % imageWidth;
-        int pixelY = index / imageWidth;
-        if (pixelX >= screenMinX && pixelX < screenMaxX && pixelY >= screenMinY && pixelY < screenMaxY) {
-            float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
-            float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-                                                 invHeight * (static_cast<float>(pixelY) + 0.5f));
-            shadePixel(circleIndex, pixelCenterNorm, p, imgPtr);
-        }
+        // Shade this pixel - but accumulate locally instead of writing to global memory
+        shadePixelLocal(circleIndex, pixelCenterNorm, p, &pixelColor);
     }
-    // // read position and radius
-    // float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-    // float  rad = cuConstRendererParams.radius[index];
-
-    // // compute the bounding box of the circle. The bound is in integer
-    // // screen coordinates, so it's clamped to the edges of the screen.
-
-    // short minX = static_cast<short>(imageWidth * (p.x - rad));
-    // short maxX = static_cast<short>(imageWidth * (p.x + rad)) + 1;
-    // short minY = static_cast<short>(imageHeight * (p.y - rad));
-    // short maxY = static_cast<short>(imageHeight * (p.y + rad)) + 1;
-
-    // // a bunch of clamps.  Is there a CUDA built-in for this?
-    // short screenMinX = (minX > 0) ? ((minX < imageWidth) ? minX : imageWidth) : 0;
-    // short screenMaxX = (maxX > 0) ? ((maxX < imageWidth) ? maxX : imageWidth) : 0;
-    // short screenMinY = (minY > 0) ? ((minY < imageHeight) ? minY : imageHeight) : 0;
-    // short screenMaxY = (maxY > 0) ? ((maxY < imageHeight) ? maxY : imageHeight) : 0;
-
-    // float invWidth = 1.f / imageWidth;
-    // float invHeight = 1.f / imageHeight;
-
-    // // for all pixels in the bonding box
-    // for (int pixelY=screenMinY; pixelY<screenMaxY; pixelY++) {
+    
+    // SINGLE WRITE to global memory at the end
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    *imgPtr = pixelColor;
+}
+__global__ void kernelCountCirclesPerTile(int* tileCounts, int numTilesX, int numTilesY) {
+    int tileIndex = blockIdx.x;  // One tile per block
+    int numTiles = numTilesX * numTilesY;
+    
+    if (tileIndex >= numTiles)
+        return;
+    
+    int tileX = tileIndex % numTilesX;
+    int tileY = tileIndex / numTilesX;
+    
+    __shared__ uint prefixSumInput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumOutput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumScratch[2 * SCAN_BLOCK_DIM];
+    
+    // Calculate tile bounds in normalized coordinates
+    float boxL = (float)(tileX * TILE_SIZE) / cuConstRendererParams.imageWidth;
+    float boxR = (float)((tileX + 1) * TILE_SIZE) / cuConstRendererParams.imageWidth;
+    float boxB = (float)(tileY * TILE_SIZE) / cuConstRendererParams.imageHeight;
+    float boxT = (float)((tileY + 1) * TILE_SIZE) / cuConstRendererParams.imageHeight;
+    
+    int numCircles = cuConstRendererParams.numCircles;
+    int count = 0;
+    
+    // Process circles in chunks of SCAN_BLOCK_DIM
+    for (int chunkStart = 0; chunkStart < numCircles; chunkStart += SCAN_BLOCK_DIM) {
+        int circleIndex = chunkStart + threadIdx.x;
         
-    //     for (int pixelX=screenMinX; pixelX<screenMaxX; pixelX++) {
-    //         float2 pixelCenterNorm = make_float2(invWidth * (static_cast<float>(pixelX) + 0.5f),
-    //                                              invHeight * (static_cast<float>(pixelY) + 0.5f));
-    //         shadePixel(index, pixelCenterNorm, p, imgPtr);
-    //         imgPtr++;
-    //     }
-    // }
+        // Check if this circle intersects the tile
+        uint intersects = 0;
+        if (circleIndex < numCircles) {
+            int index3 = 3 * circleIndex;
+            float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+            float rad = cuConstRendererParams.radius[circleIndex];
+            intersects = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+        }
+        
+        // Use scan to count (helps reduce divergence)
+        prefixSumInput[threadIdx.x] = intersects;
+        __syncthreads();
+        
+        sharedMemExclusiveScan(threadIdx.x, prefixSumInput, prefixSumOutput, 
+                               prefixSumScratch, SCAN_BLOCK_DIM);
+        __syncthreads();
+        
+        // Get count for this chunk
+        int chunkCount = prefixSumOutput[SCAN_BLOCK_DIM - 1] + prefixSumInput[SCAN_BLOCK_DIM - 1];
+        count += chunkCount;
+    }
+    
+    // Write total count for this tile
+    if (threadIdx.x == 0) {
+        tileCounts[tileIndex] = count;
+    }
 }
 
+__global__ void kernelWriteCompactedLists(
+    int* circleOffsets,      // Input: precomputed offsets from scan
+    int* compactedCircles,   // Output: compacted circle indices
+    int numTilesX,
+    int numTilesY
+) {
+    int tileIndex = blockIdx.x;  // One tile per block
+    
+    if (tileIndex >= numTilesX * numTilesY)
+        return;
+    
+    int tileX = tileIndex % numTilesX;
+    int tileY = tileIndex / numTilesX;
+    
+    __shared__ uint prefixSumInput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumOutput[SCAN_BLOCK_DIM];
+    __shared__ uint prefixSumScratch[2 * SCAN_BLOCK_DIM];
+    
+    // Calculate tile bounds
+    float boxL = (float)(tileX * TILE_SIZE) / cuConstRendererParams.imageWidth;
+    float boxR = (float)((tileX + 1) * TILE_SIZE) / cuConstRendererParams.imageWidth;
+    float boxB = (float)(tileY * TILE_SIZE) / cuConstRendererParams.imageHeight;
+    float boxT = (float)((tileY + 1) * TILE_SIZE) / cuConstRendererParams.imageHeight;
+    
+    // Get this tile's base offset (where it starts writing)
+    int baseOffset = circleOffsets[tileIndex];
+    int numCircles = cuConstRendererParams.numCircles;
+    int writeOffset = 0;
+    
+    // Process circles in chunks
+    for (int chunkStart = 0; chunkStart < numCircles; chunkStart += SCAN_BLOCK_DIM) {
+        int circleIndex = chunkStart + threadIdx.x;
+        
+        // Check intersection
+        uint intersects = 0;
+        if (circleIndex < numCircles) {
+            int index3 = 3 * circleIndex;
+            float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
+            float rad = cuConstRendererParams.radius[circleIndex];
+            intersects = circleInBoxConservative(p.x, p.y, rad, boxL, boxR, boxT, boxB);
+        }
+        
+        // Scan to get write positions within this chunk
+        prefixSumInput[threadIdx.x] = intersects;
+        __syncthreads();
+        
+        sharedMemExclusiveScan(threadIdx.x, prefixSumInput, prefixSumOutput, 
+                               prefixSumScratch, SCAN_BLOCK_DIM);
+        __syncthreads();
+        
+        // Write circle index if it intersects
+        if (intersects && circleIndex < numCircles) {
+            int pos = baseOffset + writeOffset + prefixSumOutput[threadIdx.x];
+            compactedCircles[pos] = circleIndex;
+        }
+        __syncthreads();
+        
+        // Update write offset for next chunk
+        int chunkCount = prefixSumOutput[SCAN_BLOCK_DIM - 1] + prefixSumInput[SCAN_BLOCK_DIM - 1];
+        writeOffset += chunkCount;
+    }
+}
 ////////////////////////////////////////////////////////////////////////////////////////
 
 
@@ -664,14 +738,67 @@ CudaRenderer::advanceAnimation() {
     cudaDeviceSynchronize();
 }
 
-void
-CudaRenderer::render() {
-
-    // 256 threads per block is a healthy number
-    dim3 blockDim(256, 1);
-
-    dim3 gridDim((image->width * image->height + blockDim.x - 1) / blockDim.x);
-
-    kernelRenderCircles<<<gridDim, blockDim>>>();
+void CudaRenderer::render() {
+    int numTilesX = (image->width + TILE_SIZE - 1) / TILE_SIZE;
+    int numTilesY = (image->height + TILE_SIZE - 1) / TILE_SIZE;
+    int numTiles = numTilesX * numTilesY;
+    
+    int* tileCounts;
+    int* circleOffsets;
+    
+    cudaMalloc(&tileCounts, sizeof(int) * numTiles);
+    cudaMalloc(&circleOffsets, sizeof(int) * (numTiles + 1));
+    
+    // Phase 1
+    dim3 blockDim(SCAN_BLOCK_DIM);
+    dim3 gridDim(numTiles);
+    kernelCountCirclesPerTile<<<gridDim, blockDim>>>(tileCounts, numTilesX, numTilesY);
     cudaDeviceSynchronize();
+    
+    // Debug: Check first few counts
+    int testCounts[10];
+    cudaMemcpy(testCounts, tileCounts, sizeof(int) * 10, cudaMemcpyDeviceToHost);
+    printf("First 10 tile counts: ");
+    for (int i = 0; i < 10; i++) printf("%d ", testCounts[i]);
+    printf("\n");
+    
+    // Phase 2: Scan
+    thrust::device_ptr<int> counts_ptr(tileCounts);
+    thrust::device_ptr<int> offsets_ptr(circleOffsets);
+    thrust::exclusive_scan(counts_ptr, counts_ptr + numTiles, offsets_ptr);
+    
+    // Set last element properly
+    int lastOffset, lastCount;
+    cudaMemcpy(&lastOffset, circleOffsets + (numTiles - 1), sizeof(int), cudaMemcpyDeviceToHost);
+    cudaMemcpy(&lastCount, tileCounts + (numTiles - 1), sizeof(int), cudaMemcpyDeviceToHost);
+    int totalRefs = lastOffset + lastCount;
+    cudaMemcpy(circleOffsets + numTiles, &totalRefs, sizeof(int), cudaMemcpyHostToDevice);
+    
+    printf("Total circle references: %d\n", totalRefs);
+    
+    if (totalRefs == 0) {
+        printf("ERROR: No circles found in any tile!\n");
+        return;
+    }
+    
+    int* compactedCircles;
+    cudaMalloc(&compactedCircles, sizeof(int) * totalRefs);
+    
+    // Phase 3
+    kernelWriteCompactedLists<<<gridDim, blockDim>>>(circleOffsets, compactedCircles, 
+                                                      numTilesX, numTilesY);
+    cudaDeviceSynchronize();
+    
+    // Phase 4
+    dim3 blockDim2(16, 16);
+    dim3 gridDim2(
+        (image->width + blockDim2.x - 1) / blockDim2.x,
+        (image->height + blockDim2.y - 1) / blockDim2.y
+    );
+    kernelRenderCircles<<<gridDim2, blockDim2>>>(circleOffsets, compactedCircles, numTilesX);
+    cudaDeviceSynchronize();
+    
+    cudaFree(tileCounts);
+    cudaFree(circleOffsets);
+    cudaFree(compactedCircles);
 }
