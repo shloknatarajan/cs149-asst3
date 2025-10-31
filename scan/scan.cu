@@ -27,6 +27,22 @@ static inline int nextPow2(int n) {
     return n;
 }
 
+// exclusive_scan --
+//
+// Implementation of an exclusive scan on global memory array `input`,
+// with results placed in global memory `result`.
+//
+// N is the logical size of the input and output arrays, however
+// students can assume that both the start and result arrays we
+// allocated with next power-of-two sizes as described by the comments
+// in cudaScan().  This is helpful, since your parallel scan
+// will likely write to memory locations beyond N, but of course not
+// greater than N rounded up to the next power of 2.
+//
+// Also, as per the comments in cudaScan(), you can implement an
+// "in-place" scan, since the timing harness makes a copy of input and
+// places it in result
+
 __global__ void mark_repeats_kernel(int* input, int length, int* flags) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     
