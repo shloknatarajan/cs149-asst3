@@ -396,23 +396,23 @@ __global__ void kernelRenderCircles(int* circleOffsets, int* compactedCircles, i
         invWidth * (static_cast<float>(pixelX) + 0.5f),
         invHeight * (static_cast<float>(pixelY) + 0.5f)
     );
-    
-    // LOCAL ACCUMULATOR - stays in registers!
-    float4 pixelColor = make_float4(1.f, 1.f, 1.f, 1.f); // Start with cleared color
-    
+
+    // Read the initial pixel value from the cleared image (ONE READ at start)
+    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
+    float4 pixelColor = *imgPtr;  // Start with background (e.g., gradient for snowflakes)
+
     // Loop through circles IN ORDER and accumulate locally
     for (int i = startIdx; i < endIdx; i++) {
         int circleIndex = compactedCircles[i];
-        
+
         int index3 = 3 * circleIndex;
         float3 p = *(float3*)(&cuConstRendererParams.position[index3]);
-        
+
         // Shade this pixel - but accumulate locally instead of writing to global memory
         shadePixelLocal(circleIndex, pixelCenterNorm, p, &pixelColor);
     }
-    
+
     // SINGLE WRITE to global memory at the end
-    float4* imgPtr = (float4*)(&cuConstRendererParams.imageData[4 * (pixelY * imageWidth + pixelX)]);
     *imgPtr = pixelColor;
 }
 __global__ void kernelCountCirclesPerTile(int* tileCounts, int numTilesX, int numTilesY) {
