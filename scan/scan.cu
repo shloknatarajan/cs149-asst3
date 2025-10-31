@@ -79,7 +79,7 @@ void exclusive_scan(int* input, int N, int* result)
     // scan.
     int rounded_N = nextPow2(N);
     
-    // Upsweep phase
+    // Upsweep
     for (int two_d = 1; two_d <= rounded_N/2; two_d *= 2) {
         int two_dplus1 = 2 * two_d;
         int num_iterations = rounded_N / two_dplus1;
@@ -90,10 +90,10 @@ void exclusive_scan(int* input, int N, int* result)
         upsweep_kernel<<<blocks, threadsPerBlock>>>(result, num_iterations, two_d, two_dplus1);
     }
 
-    // Set last element to 0
+    // Set last to 0
     cudaMemset(&result[rounded_N - 1], 0, sizeof(int));
     
-    // Downsweep phase
+    // Downsweep
     for (int two_d = rounded_N/2; two_d >= 1; two_d /= 2) {
         int two_dplus1 = 2 * two_d;
         int num_iterations = rounded_N / two_dplus1;
